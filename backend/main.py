@@ -48,7 +48,7 @@ RSI_PERIOD = 14
 URGENCY_MINUTES_THRESHOLD = 60
 
 TRADE_QUOTAS = {
-    "WD_Morning": 2, "WD_Afternoon": 2, "WD_Evening": 2, "WD_Late_Night": 0, "WE_Active": 2
+    "WD_Morning": 4, "WD_Afternoon": 4, "WD_Evening": 4, "WD_Late_Night": 0, "WE_Active": 4
 }
 
 # Setup SQLite Database
