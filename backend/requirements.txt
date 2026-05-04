@@ -6,3 +6,7 @@ pandas
 numpy
 yfinance
 groq
+python-dotenv
+scikit-learn
+tensorflow
+holidays

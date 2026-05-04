@@ -14,6 +14,9 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from groq import Groq
 
+import lstm_model
+from analytics_engine import AdvancedTradingAnalytics, parse_logs_to_metrics
+
 # =====================================================================
 # 1. MASTER CONFIGURATION
 # =====================================================================
@@ -61,6 +64,9 @@ CREATE TABLE IF NOT EXISTS logs (
 )
 """)
 conn.commit()
+
+# 🎯 ตัวแปรเก็บสัญญาณที่ AI วิเคราะห์ได้ (รอหน้าเว็บมารับ)
+pending_signal = None
 
 # =====================================================================
 # 2. MODELS & PROMPTS
@@ -209,14 +215,158 @@ def log_to_json(log_entry):
     logs.append(log_entry)
     with open(LOG_FILE_NAME, "w", encoding="utf-8") as f: json.dump(logs[-50:], f, indent=4, ensure_ascii=False)
 
+
+def get_period_trade_bounds(period_key, now):
+    current_date = now.date()
+    if period_key == "WD_Late_Night":
+        return datetime.combine(current_date, dt_time(0, 0, 0)), datetime.combine(current_date, dt_time(1, 59, 59))
+    if period_key == "WD_Morning":
+        return datetime.combine(current_date, dt_time(6, 0, 0)), datetime.combine(current_date, dt_time(11, 59, 59))
+    if period_key == "WD_Afternoon":
+        return datetime.combine(current_date, dt_time(12, 0, 0)), datetime.combine(current_date, dt_time(17, 59, 59))
+    if period_key == "WD_Evening":
+        return datetime.combine(current_date, dt_time(18, 0, 0)), datetime.combine(current_date, dt_time(23, 59, 59))
+    if period_key == "WE_Active":
+        return datetime.combine(current_date, dt_time(9, 30, 0)), datetime.combine(current_date, dt_time(17, 29, 59))
+    return None, None
+
+
+def get_period_trade_counts(period_key, now):
+    start, end = get_period_trade_bounds(period_key, now)
+    if not start or not os.path.isfile(LOG_FILE_NAME):
+        return 0, 0
+    try:
+        with open(LOG_FILE_NAME, "r", encoding="utf-8") as f:
+            logs = json.load(f)
+    except:
+        return 0, 0
+
+    buy_count = 0
+    sell_count = 0
+    for entry in logs:
+        try:
+            entry_dt = datetime.strptime(entry.get("date", ""), "%Y-%m-%d %H:%M:%S")
+        except:
+            continue
+        if entry_dt < start or entry_dt > end:
+            continue
+        action = str(entry.get("action", "")).upper()
+        if action == "BUY":
+            buy_count += 1
+        elif action == "SELL":
+            sell_count += 1
+    return buy_count, sell_count
+
+
 def push_log_to_server(action, price, reason, amount, current_nav, ai_action, user_action):
     if not ENABLE_UNIVERSITY_API: return
     payload = {"action": action, "price": "MARKET" if price == "MARKET" else float(price), "reason": reason, "executed_amount": amount, "net_asset_value": current_nav, "signal_source": "AI_Agent_WebApp", "ai_intended_action": ai_action, "user_override_action": user_action}
     try: requests.post(f"{LOG_BASE_URL}/logs", headers={"Authorization": f"Bearer {TEAM_API_KEY}"}, json=payload, timeout=5)
     except: pass
 
+# 🎯 ฟังก์ชันหลักสำหรับให้ AI วิเคราะห์ตลาด (ใช้ LSTM Model ของ gold-trading-platform)
+def run_ai_analysis_logic():
+    now = get_thai_time()
+    portfolio = load_portfolio()
+    market = get_live_hsh_data()
+    global_math = get_global_markets()
+    news = get_news()
+    period_key, period_name, is_active, end_time = get_trading_period(now)
+
+    if not is_active or not market or not global_math:
+        return None
+
+    target_trades = TRADE_QUOTAS.get(period_key, 0)
+    current_trades = portfolio["Trades_Count"]
+    minutes_remaining = int((end_time - now).total_seconds() / 60)
+    weekend_rule = (
+        f" WEEKEND MODE: Use minimum amount (AMOUNT_THB: {TRADE_MIN_THB:.2f})."
+        if "WE_" in period_key
+        else ""
+    )
+
+    buy_count, sell_count = get_period_trade_counts(period_key, now)
+    missing_actions = []
+    if buy_count == 0:
+        missing_actions.append("BUY")
+    if sell_count == 0:
+        missing_actions.append("SELL")
+
+    if target_trades == 0:
+        dynamic_quota = "No strict quota. Trade on clear convergence." + weekend_rule
+    elif current_trades < target_trades and minutes_remaining <= URGENCY_MINUTES_THRESHOLD:
+        dynamic_quota = (
+            f"URGENT: MUST trade NOW to pass limit ({minutes_remaining} mins left). Use AMOUNT_THB: {TRADE_MIN_THB:.2f}."
+            + weekend_rule
+        )
+    else:
+        dynamic_quota = (
+            f"Quota Status: {current_trades}/{target_trades}. Trade normally."
+            + weekend_rule
+        )
+
+    if missing_actions:
+        missing_label = " and ".join(missing_actions)
+        missing_hint = (
+            f" IMPORTANT: This period currently has no {missing_label}. "
+            "If you can, choose the missing action before period ends. "
+        )
+        if len(missing_actions) == 2:
+            missing_hint += (
+                "If both are missing, start with BUY when cash is available, "
+                "or SELL if gold is already held, and then complete the opposite side later. "
+            )
+        dynamic_quota += missing_hint
+
+    lstm_live_data = {
+        "HSH_Buy": market["HSH_Buy"],
+        "HSH_Sell": market["HSH_Sell"],
+        "xau_price": global_math["xau_price"],
+        "current_thb": global_math["current_thb"],
+        "rsi": global_math["rsi"],
+    }
+    predicted_price = lstm_model.predict_next_price_with_lstm(lstm_live_data)
+    if predicted_price is None:
+        predicted_price = market["HSH_Buy"]
+
+    p_buy_gram = market["HSH_Sell"] / BAHT_TO_GRAM
+    p_sell_gram = market["HSH_Buy"] / BAHT_TO_GRAM
+
+    prompt_content = PROMPTS[LANGUAGE]["manager"].format(
+        balance=portfolio["THB_Balance"],
+        gold_gram=portfolio["Gold_Gram"],
+        price_per_gram_buy=p_buy_gram,
+        price_per_gram_sell=p_sell_gram,
+        trade_min=TRADE_MIN_THB,
+        period_name=period_name,
+        trades_count=current_trades,
+        target_trades=target_trades,
+        minutes_remaining=minutes_remaining,
+        quota_instruction=dynamic_quota,
+    )
+
+    decision = ask_groq(prompt_content)
+    ai_act, ai_reason, ai_amt = "HOLD", "Default Hold", "ALL"
+    for line in decision.split("\n"):
+        line_u = line.upper()
+        if "ACTION:" in line_u:
+            ai_act = line_u.split(":", 1)[1].strip()
+        elif "AMOUNT_THB:" in line_u:
+            ai_amt = line.split(":", 1)[1].strip().replace(",", "")
+        elif "REASONING:" in line_u:
+            ai_reason = line.split(":", 1)[1].strip()
+
+    return {
+        "ai_action": ai_act,
+        "ai_amount_thb": ai_amt,
+        "ai_reason": f"<strong>AI Reason:</strong> {ai_reason}",
+        "current_market_price": market["HSH_Sell"]
+        if ai_act == "BUY"
+        else market["HSH_Buy"],
+    }
+
 # =====================================================================
-# 3.5 BACKGROUND TASKS (ดึงกราฟกลาง)
+# 3.5 BACKGROUND TASKS (ดึงกราฟกลาง + AI Analysis)
 # =====================================================================
 async def poll_chart_data():
     while True:
@@ -242,9 +392,42 @@ async def poll_chart_data():
         
         await asyncio.sleep(60) # ดึงทุก 60 วินาที
 
+# 🎯 Background Task 2: ให้ AI วิเคราะห์อัตโนมัติทุก 15 นาที (Autonomous AI)
+async def auto_analysis_loop():
+    global pending_signal
+
+    while True:
+        try:
+            now = get_thai_time()
+
+            # ทำการ analyze ทุก 15 นาทีเพื่อให้ user สามารถตัดสินใจได้ในเวลา 15 วินาที
+            if now.minute % 15 == 0 and now.second < 10:
+                print(
+                    f"[{now.strftime('%H:%M:%S')}] 🤖 Backend: Running Autonomous AI Analysis..."
+                )
+
+                result = run_ai_analysis_logic()
+
+                if result:
+                    ai_act = result.get("ai_action", "HOLD")
+
+                    # แสดงสัญญาณเฉพาะตอนเปลี่ยนเป็น BUY/SELL
+                    if ai_act in ["BUY", "SELL"]:
+                        print(f"🔥 Signal Alert: {ai_act}")
+                        # ตั้ง pending_signal เพื่อให้ frontend รับ
+                        pending_signal = result
+
+                await asyncio.sleep(60)
+
+        except Exception as e:
+            print(f"Auto Analysis Error: {e}")
+
+        await asyncio.sleep(5)
+
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(poll_chart_data())
+    asyncio.create_task(auto_analysis_loop())
 
 
 # =====================================================================
@@ -276,8 +459,45 @@ def get_status():
         portfolio['Trades_Count'] = 0
         save_portfolio(portfolio)
 
-    nav = portfolio['THB_Balance'] + (portfolio['Gold_Gram'] * (market['HSH_Buy'] / BAHT_TO_GRAM)) if market else portfolio['THB_Balance']
-    return {"portfolio": portfolio, "market": market, "net_asset_value": nav, "period": {"name": period_name, "is_active": is_active, "trades_done": portfolio['Trades_Count']}}
+    if market is None:
+        return {"error": "Market data unavailable"}
+
+    price_g = (market["HSH_Buy"] / BAHT_TO_GRAM)
+    nav = portfolio['THB_Balance'] + (portfolio['Gold_Gram'] * price_g)
+    
+    # 🎯 Calculate analytics
+    closed, unrealized, first_date = parse_logs_to_metrics(LOG_FILE_NAME, price_g)
+    report = AdvancedTradingAnalytics.generate_full_report(
+        closed, unrealized, nav, first_date, STARTING_THB
+    )
+
+    return {
+        "portfolio": portfolio,
+        "market": market,
+        "net_asset_value": nav,
+        "period": {
+            "name": period_name,
+            "is_active": is_active,
+            "trades_done": portfolio['Trades_Count']
+        },
+        "performance": {
+            "total_closed_trade": report["Total Closed Trade"],
+            "win_rate": report["Win Rate (%)"],
+            "total_profit": report["Total Profit (THB)"],
+            "unrealized_pl": report["Unrealized P/L (THB)"],
+            "avg_win": report["Average Win (THB)"],
+            "avg_loss": report["Average Loss (THB)"],
+            "expectancy": report["Expectancy per Trade (THB)"],
+            "best_trade": report["Best Annualized Trade (%)"],
+            "worst_trade": report["Worst Annualized Trade (%)"],
+            "median_trade": report["Median Annualized Trade (%)"],
+            "top10_trade": report["Top 10% Annualized Trade (%)"],
+            "bottom10_trade": report["Bottom 10% Annualized Trade (%)"],
+            "xirr": report["XIRR (%)"],
+            "avg_capital_year": report["Avg Capital/Year (THB)"],
+            "sharpe_ratio": report["Sharpe Ratio"],
+        },
+    }
 
 @api_router.post("/portfolio")
 def update_portfolio(req: PortfolioUpdate):
@@ -287,103 +507,177 @@ def update_portfolio(req: PortfolioUpdate):
     save_portfolio(portfolio)
     return {"status": "success"}
 
-@api_router.post("/analyze")
-def trigger_analysis():
-    now = get_thai_time()
-    portfolio = load_portfolio()
-    market = get_live_hsh_data()
-    global_math = get_global_markets()
-    news = get_news()
-    period_key, period_name, is_active, end_time = get_trading_period(now)
+# 🎯 API ใหม่สำหรับหน้าเว็บมาเช็คสัญญาณที่ AI วิเคราะห์ทิ้งไว้
+@api_router.get("/pending-signal")
+def get_pending_signal():
+    global pending_signal
+    return {"signal": pending_signal}
 
-    if not is_active or not market or not global_math:
-        return {"error": "Market Closed/Offline", "ai_action": "HOLD", "ai_reason": "Out of Trading Hours or Data Unavailable"}
+# 🎯 API สำหรับ Manual Trade ที่ผู้ใช้กดได้ตลอดเวลา
+class ManualTradeRequest(BaseModel):
+    action: str  # "BUY" or "SELL"
+    amount_thb: str  # amount in THB or "ALL"
 
-    p_buy_gram = market['HSH_Sell'] / BAHT_TO_GRAM
-    p_sell_gram = market['HSH_Buy'] / BAHT_TO_GRAM
-    
-    target_trades = TRADE_QUOTAS.get(period_key, 0)
-    current_trades = portfolio['Trades_Count']
-    minutes_remaining = int((end_time - now).total_seconds() / 60)
-
-    weekend_rule = f" WEEKEND MODE: Use minimum amount (AMOUNT_THB: {TRADE_MIN_THB:.2f})." if "WE_" in period_key else ""
-    if target_trades == 0: dynamic_quota = "No strict quota. Trade on clear convergence." + weekend_rule
-    elif current_trades < target_trades and minutes_remaining <= URGENCY_MINUTES_THRESHOLD:
-        dynamic_quota = f"URGENT: MUST trade NOW to pass limit ({minutes_remaining} mins left). Use AMOUNT_THB: {TRADE_MIN_THB:.2f}." + weekend_rule
-    else: dynamic_quota = f"Quota Status: {current_trades}/{target_trades}. Trade normally." + weekend_rule
-
-    # Multi-Persona Analysis
-    eco_out = ask_groq(PROMPTS[LANGUAGE]["eco"].format(news=news))
-    quant_out = ask_groq(PROMPTS[LANGUAGE]["quant"].format(xau_price=global_math['xau_price'], rsi=global_math['rsi'], ema_signal=global_math['ema_signal'], hsh_spread=market['HSH_Spread'], premium=market['HSH_Premium'], rsi_period=RSI_PERIOD, ema_fast=EMA_FAST, ema_slow=EMA_SLOW))
-    currency_out = ask_groq(PROMPTS[LANGUAGE]["currency"].format(current_thb=global_math['current_thb'], thb_trend=global_math['thb_trend'], thb_slope=global_math['thb_slope'], forex_period=FOREX_HISTORY_PERIOD))
-
-    decision = ask_groq(PROMPTS[LANGUAGE]["manager"].format(
-        balance=portfolio['THB_Balance'], gold_gram=portfolio['Gold_Gram'], price_per_gram_buy=p_buy_gram, price_per_gram_sell=p_sell_gram,
-        eco=eco_out, quant=quant_out, currency=currency_out, trade_min=TRADE_MIN_THB, period_name=period_name,
-        trades_count=current_trades, target_trades=target_trades, minutes_remaining=minutes_remaining, quota_instruction=dynamic_quota
-    ))
-
-    ai_act, ai_reason, ai_amt = "HOLD", "Default Hold", "ALL"
-    for line in decision.split('\n'):
-        line_u = line.upper()
-        if "ACTION:" in line_u: ai_act = line_u.split(":", 1)[1].strip()
-        elif "AMOUNT_THB:" in line_u: ai_amt = line.split(":", 1)[1].strip().replace(',', '')
-        elif "REASONING:" in line_u: ai_reason = line.split(":", 1)[1].strip()
-
-    full_reason = f"<strong>AI Reason:</strong> {ai_reason}<br/><br/><i>[Quant]</i> {quant_out}<br/><i>[Currency]</i> {currency_out}"
-    return {"ai_action": ai_act, "ai_amount_thb": ai_amt, "ai_reason": full_reason}
-
-@api_router.post("/execute")
-def execute_trade(req: ExecuteRequest):
+@api_router.post("/manual-trade")
+def manual_trade(req: ManualTradeRequest):
     now = get_thai_time()
     portfolio = load_portfolio()
     market = get_live_hsh_data()
     period_key, _, _, _ = get_trading_period(now)
-    
-    p_buy_gram = market['HSH_Sell'] / BAHT_TO_GRAM
-    p_sell_gram = market['HSH_Buy'] / BAHT_TO_GRAM
-    
-    final_act = req.ai_action if req.user_action == "TIMEOUT" else req.user_action
-    act, exec_price, exec_amt_str = "HOLD", "MARKET", "0"
-    
-    # Fractional Execution Engine
-    if final_act == "BUY" and portfolio['THB_Balance'] >= TRADE_MIN_THB:
-        target_thb = portfolio['THB_Balance']
-        if req.ai_amount_thb != "ALL":
-            try: target_thb = max(TRADE_MIN_THB, min(float(req.ai_amount_thb), portfolio['THB_Balance']))
-            except: pass
-        
-        gram_bought = round(target_thb / p_buy_gram, 4)
-        portfolio['Gold_Gram'] += gram_bought
-        portfolio['THB_Balance'] -= target_thb
-        portfolio['Trades_Count'] += 1
-        act, exec_price, exec_amt_str = "BUY", market['HSH_Sell'], f"{gram_bought}g ({target_thb} THB)"
-        
-    elif final_act == "SELL" and portfolio['Gold_Gram'] > 0:
-        current_val = portfolio['Gold_Gram'] * p_sell_gram
-        target_thb = current_val
-        if req.ai_amount_thb != "ALL":
-            try: target_thb = min(float(req.ai_amount_thb), current_val)
-            except: pass
 
-        gram_sold = min(round(target_thb / p_sell_gram, 4), portfolio['Gold_Gram'])
+    if not market:
+        return {"error": "Market data unavailable"}
+
+    p_buy_gram = market["HSH_Sell"] / BAHT_TO_GRAM
+    p_sell_gram = market["HSH_Buy"] / BAHT_TO_GRAM
+    act, exec_price, exec_amt_str = "HOLD", "MARKET", "0"
+
+    if req.action == "BUY" and portfolio["THB_Balance"] >= TRADE_MIN_THB:
+        target_thb = portfolio["THB_Balance"]
+        if req.amount_thb != "ALL":
+            try:
+                target_thb = max(
+                    TRADE_MIN_THB,
+                    min(float(req.amount_thb), portfolio["THB_Balance"]),
+                )
+            except:
+                pass
+        gram_bought = round(target_thb / p_buy_gram, 4)
+        portfolio["Gold_Gram"] += gram_bought
+        portfolio["THB_Balance"] -= target_thb
+        portfolio["Trades_Count"] += 1
+        act, exec_price, exec_amt_str = (
+            "BUY",
+            market["HSH_Sell"],
+            f"{gram_bought}g ({target_thb} THB)",
+        )
+
+    elif req.action == "SELL" and portfolio["Gold_Gram"] > 0:
+        current_val = portfolio["Gold_Gram"] * p_sell_gram
+        target_thb = current_val
+        if req.amount_thb != "ALL":
+            try:
+                target_thb = min(float(req.amount_thb), current_val)
+            except:
+                pass
+        gram_sold = min(round(target_thb / p_sell_gram, 4), portfolio["Gold_Gram"])
         cash_returned = round(gram_sold * p_sell_gram, 2)
-        
-        portfolio['THB_Balance'] += cash_returned
-        portfolio['Gold_Gram'] -= gram_sold
-        portfolio['Trades_Count'] += 1
-        act, exec_price, exec_amt_str = "SELL", market['HSH_Buy'], f"Sold {gram_sold}g ({cash_returned} THB)"
+        portfolio["THB_Balance"] += cash_returned
+        portfolio["Gold_Gram"] -= gram_sold
+        portfolio["Trades_Count"] += 1
+        act, exec_price, exec_amt_str = (
+            "SELL",
+            market["HSH_Buy"],
+            f"Sold {gram_sold}g ({cash_returned} THB)",
+        )
 
     save_portfolio(portfolio)
-    nav = portfolio['THB_Balance'] + (portfolio['Gold_Gram'] * p_sell_gram)
-
+    nav = portfolio["THB_Balance"] + (portfolio["Gold_Gram"] * p_sell_gram)
+    
     # Logging
-    log_entry = {"date": now.strftime('%Y-%m-%d %H:%M:%S'), "period": period_key, "action": req.ai_action, "user_action": req.user_action, "executed_action": act, "price": exec_price, "reason": req.ai_reason, "amount": exec_amt_str, "total_asset_value": nav}
+    log_entry = {
+        "date": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "period": period_key,
+        "action": req.action,
+        "user_action": req.action,
+        "executed_action": act,
+        "price": exec_price,
+        "reason": f"Manual {req.action} trade",
+        "amount": exec_amt_str,
+        "total_asset_value": nav,
+    }
     log_to_json(log_entry)
-    push_log_to_server(act, exec_price, req.ai_reason, exec_amt_str, nav, req.ai_action, req.user_action)
-    cursor.execute("INSERT INTO logs (action, price, reason, timestamp) VALUES (?, ?, ?, ?)", (act, exec_price if act != "HOLD" else 0, req.ai_reason, now.isoformat()))
+    cursor.execute(
+        "INSERT INTO logs (action, price, reason, timestamp) VALUES (?, ?, ?, ?)",
+        (act, exec_price if act != "HOLD" else 0, f"Manual {req.action}", now.isoformat()),
+    )
     conn.commit()
 
+    if result := {"status": "success", "executed_action": act, "net_asset_value": nav}:
+        return result
+
+@api_router.post("/analyze")
+def trigger_analysis():
+    result = run_ai_analysis_logic()
+    if not result:
+        return {"error": "Market Offline"}
+    return result
+
+@api_router.post("/execute")
+def execute_trade(req: ExecuteRequest):
+    global pending_signal
+    now = get_thai_time()
+    portfolio = load_portfolio()
+    market = get_live_hsh_data()
+    period_key, _, _, _ = get_trading_period(now)
+    p_buy_gram = market["HSH_Sell"] / BAHT_TO_GRAM
+    p_sell_gram = market["HSH_Buy"] / BAHT_TO_GRAM
+    final_act = "HOLD" if req.user_action == "TIMEOUT" else req.user_action
+    act, exec_price, exec_amt_str = "HOLD", "MARKET", "0"
+
+    if final_act == "BUY" and portfolio["THB_Balance"] >= TRADE_MIN_THB:
+        target_thb = portfolio["THB_Balance"]
+        if req.ai_amount_thb != "ALL":
+            try:
+                target_thb = max(
+                    TRADE_MIN_THB,
+                    min(float(req.ai_amount_thb), portfolio["THB_Balance"]),
+                )
+            except:
+                pass
+        gram_bought = round(target_thb / p_buy_gram, 4)
+        portfolio["Gold_Gram"] += gram_bought
+        portfolio["THB_Balance"] -= target_thb
+        portfolio["Trades_Count"] += 1
+        act, exec_price, exec_amt_str = (
+            "BUY",
+            market["HSH_Sell"],
+            f"{gram_bought}g ({target_thb} THB)",
+        )
+
+    elif final_act == "SELL" and portfolio["Gold_Gram"] > 0:
+        current_val = portfolio["Gold_Gram"] * p_sell_gram
+        target_thb = current_val
+        if req.ai_amount_thb != "ALL":
+            try:
+                target_thb = min(float(req.ai_amount_thb), current_val)
+            except:
+                pass
+        gram_sold = min(round(target_thb / p_sell_gram, 4), portfolio["Gold_Gram"])
+        cash_returned = round(gram_sold * p_sell_gram, 2)
+        portfolio["THB_Balance"] += cash_returned
+        portfolio["Gold_Gram"] -= gram_sold
+        portfolio["Trades_Count"] += 1
+        act, exec_price, exec_amt_str = (
+            "SELL",
+            market["HSH_Buy"],
+            f"Sold {gram_sold}g ({cash_returned} THB)",
+        )
+
+    save_portfolio(portfolio)
+    nav = portfolio["THB_Balance"] + (portfolio["Gold_Gram"] * p_sell_gram)
+    log_to_json(
+        {
+            "date": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "period": period_key,
+            "action": req.ai_action,
+            "user_action": req.user_action,
+            "executed_action": act,
+            "price": exec_price,
+            "reason": req.ai_reason,
+            "amount": exec_amt_str,
+            "total_asset_value": nav,
+        }
+    )
+    parse_logs_to_metrics(LOG_FILE_NAME, p_sell_gram)
+    cursor.execute(
+        "INSERT INTO logs (action, price, reason, timestamp) VALUES (?, ?, ?, ?)",
+        (act, exec_price if act != "HOLD" else 0, req.ai_reason, now.isoformat()),
+    )
+    conn.commit()
+
+    # 🎯 เคลียร์สัญญาณหลังจากตัดสินใจเรียบร้อยแล้ว
+    pending_signal = None
     return {"status": "success", "executed_action": act, "net_asset_value": nav}
 
 app.include_router(api_router)
