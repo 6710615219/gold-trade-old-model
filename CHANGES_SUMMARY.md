@@ -19,6 +19,44 @@
 
 ---
 
+## ✅ ตอนนี้โค้ดทำอะไรได้บ้าง (Updated May 5, 2026)
+
+### Core Trading Features
+- ประมวลผลสัญญาณ AI อัตโนมัติทุก 15 นาที โดยใช้ LSTM model + prompt AI
+- เก็บสัญญาณไว้ใน `pending_signal` แล้วให้ frontend poll ได้
+- มี Countdown 15 วินาทีให้ผู้ใช้ตัดสินใจ BUY / SELL / HOLD
+- หากหมดเวลาแล้วจะทำ "HOLD" อัตโนมัติและไม่ execute ตาม AI โดยตรง
+- ผู้ใช้กด Manual Trade BUY / SELL ได้ตลอดเวลาระหว่างตลาดเปิด
+
+### Logging & Persistence
+- บันทึก Trade ทั้งหมดลง `live_gold_log.json` และ SQLite database
+- **[NEW]** ส่ง log ไปยังระบบมหาวิทยาลัย เมื่อ `ENABLE_UNIVERSITY_API` เปิด
+  - ส่ง log จาก `/execute` endpoint (AI decision trades)
+  - ส่ง log จาก `/manual-trade` endpoint (ผู้ใช้กดเอง)
+- มีระบบนับ BUY/SELL ในแต่ละช่วงเวลาเพื่อบังคับให้ครบ quota
+
+### Analytics & Dashboard
+- แสดง dashboard performance metrics ผ่าน API `/status`
+- คำนวณและแสดง 15 Performance Metrics ทั้งหมด
+- ติดตามผลประกอบการเรียลไทม์
+
+### University Log Submission (NEW - May 5, 2026)
+- เมื่อตั้ง `ENABLE_UNIVERSITY_API=true` และให้ `TEAM_API_KEY`
+- ระบบจะส่ง HTTP POST ไปยัง `https://goldtrade-logs-api.poonnatuch.workers.dev/logs`
+- ส่งข้อมูลทั้ง 3 ประเภท:
+  1. **AI Signal Trades** - จาก `run_ai_analysis_logic()` (จำนวน: 1 ครั้งต่อ 15 นาที)
+  2. **Executed AI Trades** - จาก `/execute` endpoint (ผู้ใช้ตัดสินใจเลือก AI signal)
+  3. **Manual Trades** - จาก `/manual-trade` endpoint (ผู้ใช้กดเองตามอิสระ)
+- Payload ตรงตามมาตรฐาน API ของมหาวิทยาลัย:
+  - `action`: BUY / SELL / HOLD
+  - `price`: ราคาปัจจุบัน หรือ "MARKET"
+  - `reason`: เหตุผลการตัดสินใจ
+  - `executed_amount`: จำนวนที่ซื้อ/ขายไป
+  - `net_asset_value`: มูลค่าสินทรัพย์ทั้งหมด
+  - Extra fields: `ai_intended_action`, `user_override_action`
+
+---
+
 ## 📁 ไฟล์ที่ถูกแก้ไข/เพิ่มเติม
 
 ### Backend Changes
@@ -74,12 +112,14 @@
    | Endpoint | Changes |
    |----------|---------|
    | `/status` | เพิ่ม Performance metrics ใน response |
-   | `/execute` | เพิ่มการเคลียร์ `pending_signal` หลังตัดสินใจแล้ว |
+   | `/execute` | เพิ่มการเคลียร์ `pending_signal` หลังตัดสินใจแล้ว + ส่ง log ไประบบมหาลัย |
+   | `/manual-trade` | **[NEW]** เพิ่ม push_log_to_server() เพื่อส่งไปยังระบบมหาลัย |
 
    **g) Enhanced Logging:**
    - บันทึก action, price, reason, timestamp เข้า SQLite
    - บันทึก JSON log ของ Live Gold Log
-   - แยกเก็บ Manual Trade เทียบกับ AI Suggested
+   - **[NEW May 5]** เรียก `push_log_to_server()` จาก `/execute` และ `/manual-trade`
+   - ส่ง log ไประบบมหาวิทยาลัยเมื่อเปิดใช้ `ENABLE_UNIVERSITY_API`
 
    **h) Period Trade Requirements:**
    - เพิ่ม helper สำหรับนับจำนวน BUY/SELL ในแต่ละช่วงเวลา
@@ -281,6 +321,18 @@ Dashboard Grid (15 Metrics):
 - Predictions passed to AI analysis as `lstm_pred` parameter
 - No changes to LSTM model itself
 
+### University API Integration (NEW - May 5, 2026):
+- `push_log_to_server()` function ใน main.py จัดการการส่ง log ไปมหาลัย
+- Config ใน `backend/config.py`:
+  - `ENABLE_UNIVERSITY_API`: ควบคุมว่าจะส่ง log หรือไม่ (default: False)
+  - `TEAM_API_KEY`: API key ของทีม (ดึงจาก environment variable)
+  - `LOG_BASE_URL`: `https://goldtrade-logs-api.poonnatuch.workers.dev`
+- Call sites:
+  1. `run_ai_analysis_logic()`: ส่ง log เมื่อ AI สร้างสัญญาณใหม่
+  2. `execute_trade()`: ส่ง log เมื่อผู้ใช้ตัดสินใจจากสัญญาณ AI
+  3. `manual_trade()`: ส่ง log เมื่อผู้ใช้กดซื้อ/ขายด้วยตนเอง
+- Safety: ถ้า API ไม่ตอบสนอง หรือ network error จะไม่ทำให้การเทรดหยุด (silent fail)
+
 ### Threading:
 - `auto_analysis_loop()` runs as background task via asyncio
 - Doesn't block frontend polling
@@ -305,6 +357,11 @@ Dashboard Grid (15 Metrics):
 - [x] Frontend polling updates smoothly
 - [x] No autotrade - user must click
 - [x] History management working (show all / hide)
+- [x] **[NEW]** push_log_to_server() integrated in /execute endpoint
+- [x] **[NEW]** push_log_to_server() integrated in /manual-trade endpoint
+- [x] **[NEW]** University API submission working when ENABLE_UNIVERSITY_API=true
+- [x] **[NEW]** Payload format matches university API requirements
+- [x] **[NEW]** Silent failure handling (API errors don't break trading)
 
 ---
 
@@ -368,12 +425,20 @@ Dashboard Grid (15 Metrics):
 5. ✅ **AI Signal Polling** - Every 15 minutes auto-analysis
 6. ✅ **Pending Signal System** - Frontend polling mechanism
 7. ✅ **Performance Tracking** - All key metrics calculated
+8. ✅ **[NEW May 5]** **University Log Submission** - Real-time trade logging to university API
+
+### What Changed on May 5, 2026:
+- Added `push_log_to_server()` call in `execute_trade()` endpoint
+- Added `push_log_to_server()` call in `manual_trade()` endpoint
+- Updated `backend/config.py` to support environment-based `ENABLE_UNIVERSITY_API` toggle
+- Now sends all AI signals, AI-based trades, and manual trades to university system
+- Maintains backward compatibility - all existing features work without interruption
 
 **All systems are fully operational and maintain the use of gold-trading-platform's original LSTM model.**
 
 ---
 
 **Status:** ✅ COMPLETE  
-**Date:** May 4, 2026  
-**Version:** 2.0
+**Last Updated:** May 5, 2026  
+**Version:** 2.1
 

@@ -592,6 +592,15 @@ def manual_trade(req: ManualTradeRequest):
         (act, exec_price if act != "HOLD" else 0, f"Manual {req.action}", now.isoformat()),
     )
     conn.commit()
+    push_log_to_server(
+        action=act,
+        price=exec_price,
+        reason=f"Manual {req.action} trade",
+        amount=exec_amt_str,
+        current_nav=nav,
+        ai_action="MANUAL",
+        user_action=req.action,
+    )
 
     if result := {"status": "success", "executed_action": act, "net_asset_value": nav}:
         return result
@@ -675,6 +684,15 @@ def execute_trade(req: ExecuteRequest):
         (act, exec_price if act != "HOLD" else 0, req.ai_reason, now.isoformat()),
     )
     conn.commit()
+    push_log_to_server(
+        action=act,
+        price=exec_price,
+        reason=req.ai_reason,
+        amount=exec_amt_str,
+        current_nav=nav,
+        ai_action=req.ai_action,
+        user_action=req.user_action,
+    )
 
     # 🎯 เคลียร์สัญญาณหลังจากตัดสินใจเรียบร้อยแล้ว
     pending_signal = None
